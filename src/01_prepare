@@ -1,0 +1,286 @@
+"""Step 1: clean and encode the raw HMDA 2017 New York loan application register (LAR).
+
+Input : data/raw/hmda_2017_ny_all-records_labels.csv  (CFPB historic HMDA data, all records, labels)
+Output: data/processed/hmda_clean.parquet     one row per application, readable columns
+        data/processed/hmda_encoded.parquet   one-hot / numeric matrix used for the size check
+        results/prep_summary.json             every before/after number quoted in the report
+Run   : python src/01_prepare.py   (from the project root)
+"""
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+RAW = ROOT / "data" / "raw" / "hmda_2017_ny_all-records_labels.csv"
+OUT = ROOT / "data" / "processed"
+RES = ROOT / "results"
+
+OUT.mkdir(parents=True, exist_ok=True)
+RES.mkdir(parents=True, exist_ok=True)
+
+S = {}
+raw = pd.read_csv(RAW, dtype=str)
+S["raw_rows"] = int(raw.shape[0])
+S["raw_cols"] = int(raw.shape[1])
+
+S["raw_cells"] = int(raw.size)
+S["raw_missing_cells"] = int(raw.isna().sum().sum())
+S["raw_missing_pct_by_col"] = (raw.isna().mean() * 100).round(2).to_dict() #rename
+
+#1. duplicates 
+S["exact_duplicates"] = int(raw.duplicated().sum())
+S["exact_duplicates_by_action"] = raw[raw.duplicated()]["action_taken_name"].value_counts().to_dict()
+df = raw.drop_duplicates().copy()
+
+#2. empty/constant columns
+empty_cols = []
+for col in df.columns:
+    if df[col].isna().all():
+        empty_cols.append(col)
+
+#finding col that are constant (only 1 unique value) and not already empty
+constant_cols = []
+for col in df.columns:
+    if col not in empty_cols and df[col].nunique(dropna=True) == 1:
+        constant_cols.append(col)
+
+S["dropped_all_missing"] = empty_cols
+S["dropped_constant"] = constant_cols
+
+cols_to_drop = empty_cols + constant_cols
+df = df.drop(columns=cols_to_drop)
+
+#3. numeric parsing
+numeric_columns = [
+    "loan_amount_000s", 
+    "applicant_income_000s", 
+    "rate_spread", 
+    "population", 
+    "minority_population",
+    "hud_median_family_income", 
+    "tract_to_msamd_income", 
+    "number_of_owner_occupied_units",
+    "number_of_1_to_4_family_units"
+]
+
+for col in numeric_columns:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+#4. derived demographic group 
+# standard HMDA does hispanic of any race is its own group; others by first reported race
+eth = df["applicant_ethnicity_name"]
+race = df["applicant_race_name_1"]
+NP = "Information not provided by applicant in mail, Internet, or telephone application"
+
+conditions = [
+    eth.eq("Not applicable") | race.eq("Not applicable"),
+    eth.eq("Hispanic or Latino"),
+    race.eq(NP) | eth.eq(NP),
+    race.eq("White"), 
+    race.eq("Black or African American"), 
+    race.eq("Asian")
+]
+
+choices = [
+    "Not applicable (non-natural person)", 
+    "Hispanic", 
+    "Not provided", 
+    "White", 
+    "Black", 
+    "Asian"
+]
+
+group = np.select(conditions, choices, default="Other race")
+
+df["race_group"] = group
+df["multi_race"] = df["applicant_race_name_2"].notna().astype(int)
+df["has_coapplicant"] = (df["co_applicant_sex_name"] != "No co-applicant").astype(int)
+
+S["race_group_counts"] = df["race_group"].value_counts().to_dict()
+
+#2-5 race cols are >99.5% empty hence summarised by multi_race and dropped
+race_prefixes = (
+    "applicant_race_2", "applicant_race_3", "applicant_race_4", "applicant_race_5",
+    "applicant_race_name_2", "applicant_race_name_3", "applicant_race_name_4", "applicant_race_name_5",
+    "co_applicant_race_2", "co_applicant_race_3", "co_applicant_race_4", "co_applicant_race_5",
+    "co_applicant_race_name_2", "co_applicant_race_name_3", "co_applicant_race_name_4",
+    "co_applicant_race_name_5"
+)
+
+race_extra = []
+for c in df.columns:
+    matched = False
+    for p in race_prefixes:
+        if c.startswith(p):
+            matched = True
+            break
+    if matched:
+        race_extra.append(c)
+
+df = df.drop(columns=race_extra)
+S["dropped_extra_race_cols"] = len(race_extra)
+
+# 5. outcome 
+#credit decision exists only for actions 1 (originated), 2 (approved, not accepted), 3 (denied)
+act = df["action_taken"].astype(int)
+df["decision"] = act.isin([1, 2, 3]).astype(int)
+df["denied"] = np.where(act == 3, 1, np.where(act.isin([1, 2]), 0, np.nan))
+df["higher_priced"] = np.where(act == 1, df["rate_spread"].notna().astype(float), np.nan)
+
+# 6. missing values 
+missing_cols_to_check = [
+    "applicant_income_000s", "msamd", "county_code", "census_tract_number", "population",
+    "minority_population", "tract_to_msamd_income", "hud_median_family_income",
+    "rate_spread", "denial_reason_1"
+]
+
+missing_before_dict = {}
+for c in missing_cols_to_check:
+    missing_before_dict[c] = int(df[c].isna().sum())
+S["missing_before"] = missing_before_dict
+
+# income: not collected when the lender did not rely on it (non-natural persons, purchased loans,
+# streamline refinances) -> keep the row, flag it, and give it its own income band
+df["income_missing"] = df["applicant_income_000s"].isna().astype(int)
+S["income_missing_by_action"] = df.groupby("action_taken_name")["income_missing"].mean().round(4).to_dict()
+
+# no MSA: the property is outside a metropolitan area, which is a fact, not a gap
+df["msamd_name"] = df["msamd_name"].fillna("Non-metropolitan")
+
+# Denial reasons exist only for denials; reporting a reason is optional for some regulators
+denied_unreported_mask = act.eq(3) & df["denial_reason_name_1"].isna()
+S["denied_without_reason"] = int(denied_unreported_mask.sum())
+
+df.loc[denied_unreported_mask, "denial_reason_name_1"] = "Not reported"
+df["denial_reason_name_1"] = df["denial_reason_name_1"].fillna("Not denied")
+
+# Count total valid denial reasons
+denial_cols = ["denial_reason_1", "denial_reason_2", "denial_reason_3"]
+df["n_denial_reasons"] = df[denial_cols].notna().sum(axis=1)
+
+# Tract fields missing together: property not geocoded -> drop those rows
+tract = [
+    "county_code", "census_tract_number", "population", "minority_population",
+    "tract_to_msamd_income", "hud_median_family_income", "number_of_owner_occupied_units",
+    "number_of_1_to_4_family_units"
+]
+
+no_tract = df[tract].isna().any(axis=1)
+S["rows_dropped_no_tract"] = int(no_tract.sum())
+
+df = df[~no_tract].copy()
+
+# 7. outliers
+
+for c in ["loan_amount_000s", "applicant_income_000s"]:
+    x = df[c]
+    
+    #calc IQR and upper fence for outlier detection
+    q1 = x.quantile(0.25)
+    q3 = x.quantile(0.75)
+    iqr = q3 - q1
+    iqr_fence = q3 + 1.5 * iqr
+    
+    S[f"{c}_iqr_fence"] = float(iqr_fence)
+    S[f"{c}_above_fence"] = int((x > iqr_fence).sum())
+    S[f"{c}_max"] = float(x.max())
+    S[f"{c}_skew_raw"] = float(x.skew())
+    
+    #winsorize to handle extreme values
+    cap = x.quantile(0.999)
+    S[f"{c}_cap_p999"] = float(cap)
+    S[f"{c}_capped_n"] = int((x > cap).sum())
+    
+    df[c + "_w"] = x.clip(upper=cap)
+    log_col_name = "log_" + c
+    df[log_col_name] = np.log10(df[c + "_w"])
+    
+    S[f"{c}_skew_log"] = float(df[log_col_name].skew())
+
+# Create loan-to-income ratio and log version using winsorized columns
+df["loan_to_income"] = df["loan_amount_000s_w"] / df["applicant_income_000s_w"]
+df["log_lti"] = np.log10(df["loan_to_income"])
+
+# Create convenience columns for minority percentage and unique lender identifier
+df["minority_pct"] = df["minority_population"]
+df["lender"] = df["respondent_id"] + "_" + df["agency_code"]
+
+# 8. tidy names
+#col we want to keep in our final analysis dataset
+keep_columns = [
+    "lender", "agency_abbr", "loan_type_name", "property_type_name", "loan_purpose_name",
+    "owner_occupancy_name", "preapproval_name", "action_taken_name", "msamd_name", "county_name",
+    "census_tract_number", "applicant_ethnicity_name", "applicant_race_name_1", "applicant_sex_name",
+    "co_applicant_sex_name", "co_applicant_ethnicity_name", "co_applicant_race_name_1",
+    "purchaser_type_name", "denial_reason_name_1", "n_denial_reasons", "hoepa_status_name",
+    "lien_status_name", "loan_amount_000s", "loan_amount_000s_w", "log_loan_amount_000s",
+    "applicant_income_000s", "applicant_income_000s_w", "log_applicant_income_000s", "income_missing",
+    "loan_to_income", "log_lti", "rate_spread", "population", "minority_pct", "hud_median_family_income",
+    "tract_to_msamd_income", "number_of_owner_occupied_units", "number_of_1_to_4_family_units",
+    "race_group", "multi_race", "has_coapplicant", "decision", "denied", "higher_priced"
+]
+
+clean = df[keep_columns].reset_index(drop=True)
+
+#adding unique row id col at position 0
+clean.insert(0, "row_id", np.arange(len(clean)))
+
+#save 
+clean_output_path = OUT / "hmda_clean.parquet"
+clean.to_parquet(clean_output_path, index=False)
+
+#9. encoding
+nominal_cols = [
+    "agency_abbr", "loan_type_name", "property_type_name", "loan_purpose_name", "owner_occupancy_name",
+    "preapproval_name", "action_taken_name", "msamd_name", "county_name", "applicant_ethnicity_name",
+    "applicant_race_name_1", "applicant_sex_name", "co_applicant_sex_name", "co_applicant_ethnicity_name",
+    "co_applicant_race_name_1", "purchaser_type_name", "denial_reason_name_1", "hoepa_status_name",
+    "lien_status_name"
+]
+
+numeric_cols = [
+    "log_loan_amount_000s", "log_applicant_income_000s", "income_missing", "log_lti", "population",
+    "minority_pct", "hud_median_family_income", "tract_to_msamd_income", "number_of_owner_occupied_units",
+    "number_of_1_to_4_family_units", "multi_race", "has_coapplicant", "n_denial_reasons"
+]
+
+num = clean[numeric_cols].copy()
+
+#fill missing values for income and LTI using their medians (for income-missing rows)
+for c in ["log_applicant_income_000s", "log_lti"]:
+    median_val = num[c].median()
+    num[c] = num[c].fillna(median_val)
+
+#one hot encode nominal columns using pandas get_dummies
+dummies_df = pd.get_dummies(clean[nominal_cols], prefix=nominal_cols, prefix_sep="=", dtype="int8")
+
+#concatenate numeric and dummy features into one encoded matrix
+enc = pd.concat([num, dummies_df], axis=1)
+
+encoded_output_path = OUT / "hmda_encoded.parquet"
+enc.to_parquet(encoded_output_path, index=False)
+
+nominal_levels_dict = {}
+for c in nominal_cols:
+    nominal_levels_dict[c] = int(clean[c].nunique())
+
+S.update({
+    "clean_rows": int(len(clean)), 
+    "clean_cols": int(clean.shape[1]),
+    "encoded_rows": int(len(enc)), 
+    "encoded_features": int(enc.shape[1]),
+    "encoded_cells": int(enc.size), 
+    "encoded_missing_cells": int(enc.isna().sum().sum()),
+    "nominal_levels": nominal_levels_dict,
+    "rows_lost_total": int(S["raw_rows"] - len(clean)),
+    "decision_rows": int(clean["decision"].sum()),
+    "action_counts": clean["action_taken_name"].value_counts().to_dict(),
+})
+
+summary_output_path = RES / "prep_summary.json"
+summary_output_path.write_text(json.dumps(S, indent=2, default=str))
+
+summary_to_print = {k: v for k, v in S.items() if k != "raw_missing_pct_by_col"}
+print(json.dumps(summary_to_print, indent=1, default=str))
